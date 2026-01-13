@@ -7,13 +7,14 @@ import re
 st.set_page_config(page_title="Tickets Tracking Dashboard", layout="wide")
 
 st.title("📞 Tickets Tracking Dashboard")
-st.markdown("Upload your **Incoming** and **Outgoing** call CSV files to generate the agent performance report.")
+st.markdown("Upload your **Incoming**, **Outgoing**, and **Tickets** CSV files to generate the agent performance report.")
 
 # Sidebar for file uploads
 with st.sidebar:
     st.header("Upload Files")
-    incoming_file = st.file_uploader("Upload Incoming Calls CSV", type=['csv'])
-    outgoing_file = st.file_uploader("Upload Outgoing Calls CSV", type=['csv'])
+    incoming_file = st.file_uploader("Upload Incoming Calls CSV", type=['csv'], key="inc")
+    outgoing_file = st.file_uploader("Upload Outgoing Calls CSV", type=['csv'], key="out")
+    tickets_file = st.file_uploader("Upload Tickets Dump CSV", type=['csv'], key="tick")
 
 def clean_agent_name(name):
     if pd.isna(name):
@@ -54,32 +55,30 @@ def load_csv(uploaded_file):
     return None
 
 @st.cache_data
-def process_data(incoming_df, outgoing_df):
+def process_data(incoming_df, outgoing_df, tickets_df):
     
-    results_list = []
-    
-    # helper for metrics
-    def calculate_metrics(df, source_type):
+    # --- Helper: Calculate Metrics for a single Source ---
+    def calculate_source_metrics(df, source_type):
         metrics = pd.DataFrame()
         
-        # Identify Agent Name Column
+        # 1. Identify Agent Column
         agent_col = None
         if source_type == 'Incoming':
-            # Check for "Answered By Agent"
             col_match = [c for c in df.columns if 'answered by agent' in c.lower()]
-            if col_match:
-                agent_col = col_match[0]
-        else: # Outgoing
-            # Check for "Agent Name..."
+            if col_match: agent_col = col_match[0]
+        elif source_type == 'Outgoing':
             col_match = [c for c in df.columns if 'agent name' in c.lower()]
-            if col_match:
-                agent_col = col_match[0]
-                
+            if col_match: agent_col = col_match[0]
+        elif source_type == 'Tickets':
+            # Looking for 'Agent' based on tickets.csv header
+            col_match = [c for c in df.columns if c.lower() == 'agent']
+            if col_match: agent_col = col_match[0]
+            
         if not agent_col:
-            st.warning(f"{source_type} data missing agent name column. Skipping agent metrics for {source_type}.")
+            st.warning(f"{source_type} data missing agent name column. Skipping metrics for {source_type}.")
             return None
 
-        # Clean Names
+        # 2. Clean Names
         df['CleanAgentName'] = df[agent_col].apply(clean_agent_name)
         # Filter invalid
         df = df[~df['CleanAgentName'].isin(['---', '', 'Nan', 'None', None])]
@@ -87,138 +86,161 @@ def process_data(incoming_df, outgoing_df):
         if df.empty:
             return None
 
-        # 1. Counts
-        counts = df.groupby('CleanAgentName').size()
-        metrics = metrics.join(counts.rename(f'{source_type} Calls'), how='outer')
+        # 3. Compute Metrics based on Source Type
         
-        # 2. Resolved (Status = Answered)
-        status_col = next((c for c in df.columns if c.lower() == 'status'), None)
-        if status_col:
-            resolved_mask = df[status_col].str.lower().fillna('') == 'answered'
-            resolved_counts = df[resolved_mask].groupby('CleanAgentName').size()
-            metrics = metrics.join(resolved_counts.rename(f'{source_type} Resolved'), how='outer')
-        
-        # 3. Closed (Hangup = Normal clearing)
-        hangup_col = next((c for c in df.columns if 'hangup' in c.lower() and 'cause' in c.lower()), None)
-        if hangup_col:
-            closed_mask = df[hangup_col].str.lower().fillna('') == 'normal clearing'
-            closed_counts = df[closed_mask].groupby('CleanAgentName').size()
-            metrics = metrics.join(closed_counts.rename(f'{source_type} Closed'), how='outer')
+        # --- PHONE METRICS (Incoming/Outgoing) ---
+        if source_type in ['Incoming', 'Outgoing']:
+            # Call Count
+            counts = df.groupby('CleanAgentName').size()
+            metrics = metrics.join(counts.rename(f'{source_type} Calls'), how='outer')
             
+            # Answered Count
+            status_col = next((c for c in df.columns if c.lower() == 'status'), None)
+            if status_col:
+                answered_mask = df[status_col].str.lower().fillna('') == 'answered'
+                answered_counts = df[answered_mask].groupby('CleanAgentName').size()
+                metrics = metrics.join(answered_counts.rename(f'{source_type} Answered'), how='outer')
+        
+        # --- TICKET METRICS ---
+        elif source_type == 'Tickets':
+            # Status based metrics
+            status_col = next((c for c in df.columns if c.lower() == 'status'), None)
+            
+            if status_col:
+                # Tickets Resolved
+                # Check for "Resolved" string
+                resolved_mask = df[status_col].str.lower().fillna('') == 'resolved'
+                resolved_counts = df[resolved_mask].groupby('CleanAgentName').size()
+                metrics = metrics.join(resolved_counts.rename('Tickets Resolved'), how='outer')
+                
+                # Tickets Closed
+                # Check for "Closed" string
+                closed_mask = df[status_col].str.lower().fillna('') == 'closed'
+                closed_counts = df[closed_mask].groupby('CleanAgentName').size()
+                metrics = metrics.join(closed_counts.rename('Tickets Closed'), how='outer')
+            else:
+                 st.warning("Tickets CSV missing 'Status' column.")
+
         return metrics
 
-    # Process Incoming
-    incoming_metrics = pd.DataFrame()
-    if incoming_df is not None:
-        incoming_metrics = calculate_metrics(incoming_df, 'Incoming')
-        
-    # Process Outgoing
-    outgoing_metrics = pd.DataFrame()
-    if outgoing_df is not None:
-        outgoing_metrics = calculate_metrics(outgoing_df, 'Outgoing')
-        
-    # Merge
-    # If both None, return None
-    if incoming_metrics is None and outgoing_metrics is None:
-        return None
-        
+    # --- Process All Files ---
     final_df = pd.DataFrame()
     
-    if incoming_metrics is not None:
-        final_df = final_df.join(incoming_metrics, how='outer')
+    # 1. Incoming
+    if incoming_df is not None:
+        m = calculate_source_metrics(incoming_df, 'Incoming')
+        if m is not None: final_df = final_df.join(m, how='outer')
         
-    if outgoing_metrics is not None:
-        final_df = final_df.join(outgoing_metrics, how='outer')
+    # 2. Outgoing
+    if outgoing_df is not None:
+        m = calculate_source_metrics(outgoing_df, 'Outgoing')
+        if m is not None: final_df = final_df.join(m, how='outer')
+        
+    # 3. Tickets
+    if tickets_df is not None:
+        m = calculate_source_metrics(tickets_df, 'Tickets')
+        if m is not None: final_df = final_df.join(m, how='outer')
         
     if final_df.empty:
-        return pd.DataFrame() # Return empty but valid DF
-    
+        return pd.DataFrame()
+
     # Fill NA
     final_df = final_df.fillna(0)
     
-    # Aggregate Totals
-    # Robust summing: check if columns exist before summing
+    # --- Aggregate Totals ---
     
-    # Total Calls
+    # Total Calls = Incoming Answered? No, usually Calls = Total Attempts, match previous logic?
+    # User asked for "Incoming Answered, Outgoing Answered, Total [Answered]". 
+    # Let's keep Total Calls (Attempts) and Total Answered.
+    
     inc_calls = final_df['Incoming Calls'] if 'Incoming Calls' in final_df.columns else 0
     out_calls = final_df['Outgoing Calls'] if 'Outgoing Calls' in final_df.columns else 0
     final_df['Total Calls'] = inc_calls + out_calls
     
-    # Total Resolved
-    inc_res = final_df['Incoming Resolved'] if 'Incoming Resolved' in final_df.columns else 0
-    out_res = final_df['Outgoing Resolved'] if 'Outgoing Resolved' in final_df.columns else 0
-    final_df['Resolved'] = inc_res + out_res
+    inc_ans = final_df['Incoming Answered'] if 'Incoming Answered' in final_df.columns else 0
+    out_ans = final_df['Outgoing Answered'] if 'Outgoing Answered' in final_df.columns else 0
+    final_df['Total Answered'] = inc_ans + out_ans
     
-    # Total Closed
-    inc_closed = final_df['Incoming Closed'] if 'Incoming Closed' in final_df.columns else 0
-    out_closed = final_df['Outgoing Closed'] if 'Outgoing Closed' in final_df.columns else 0
-    final_df['Tickets Closed'] = inc_closed + out_closed
+    # Tickets Total? Maybe not needed unless asked.
     
-    # Keep main columns for display
-    display_cols = ['Incoming Calls', 'Outgoing Calls', 'Resolved', 'Tickets Closed']
-    # Filter only those that exist (or add them as 0 if missing for consistency?)
-    # Let's add them as 0 if missing so the table structure is consistent
-    for col in display_cols:
-        if col not in final_df.columns:
-            final_df[col] = 0
-            
-    final_df = final_df[display_cols]
-    final_df = final_df.astype(int)
+    final_df = final_df.fillna(0).astype(int)
     final_df.index.name = 'Agent Name'
     
     return final_df
 
 # Main Logic
-if incoming_file is None and outgoing_file is None:
+if incoming_file is None and outgoing_file is None and tickets_file is None:
     st.info("Please upload at least one CSV file to begin.")
 else:
     # Load files
     inc_df = load_csv(incoming_file)
     out_df = load_csv(outgoing_file)
+    tick_df = load_csv(tickets_file)
     
-    if inc_df is not None or out_df is not None:
-        try:
-            results = process_data(inc_df, out_df)
+    try:
+        results = process_data(inc_df, out_df, tick_df)
+        
+        if results is not None and not results.empty:
+            # Summary Metrics - Adjusted based on what's available
+            st.divider()
+            cols = st.columns(4)
+            cols[0].metric("Total Agents", len(results))
             
-            if results is not None and not results.empty:
-                # Summary
-                st.divider()
-                c1, c2, c3, c4 = st.columns(4)
-                c1.metric("Total Agents", len(results))
-                c2.metric("Total Resolved", results['Resolved'].sum())
-                c3.metric("Total Closed", results['Tickets Closed'].sum())
-                c4.metric("Total Calls", (results['Incoming Calls'].sum() + results['Outgoing Calls'].sum()))
+            if 'Total Answered' in results.columns:
+                cols[1].metric("Total Calls Answered", results['Total Answered'].sum())
+            if 'Tickets Resolved' in results.columns:
+                cols[2].metric("Tickets Resolved", results['Tickets Resolved'].sum())
+            if 'Tickets Closed' in results.columns:
+                cols[3].metric("Tickets Closed", results['Tickets Closed'].sum())
+            
+            st.divider()
+            st.subheader("Agent Performance Details")
+            
+            # Column Selection
+            all_cols = results.columns.tolist()
+            
+            # Defaults based on latest user request + new ticket info
+            # "Incoming Answered, Outgoing Answered, Total [Answered]"
+            # Plus Tickets info is likely useful now that they uploaded it.
+            default_cols = ['Incoming Answered', 'Outgoing Answered', 'Total Answered', 'Tickets Resolved', 'Tickets Closed']
+            
+            # Valid defaults check
+            valid_defaults = [c for c in default_cols if c in all_cols]
+            if not valid_defaults: valid_defaults = all_cols
+            
+            selected_cols = st.multiselect("Select Columns to Display", all_cols, default=valid_defaults)
+            
+            if selected_cols:
+                display_df = results[selected_cols]
+                st.dataframe(display_df, use_container_width=True)
                 
-                st.divider()
-                st.subheader("Agent Performance Details")
-                st.dataframe(results, use_container_width=True)
-                
-                csv = results.to_csv()
+                csv = display_df.to_csv()
                 st.download_button("Download Report (CSV)", csv, "agent_report.csv", "text/csv")
-                
-                # Debug View
-                with st.expander("Debug: Inspect Raw vs Cleaned Names"):
-                    st.write("This section shows how agent names were extracted from the files.")
-                    
-                    if inc_df is not None:
-                        st.subheader("Incoming File")
-                        # Recalculate for display
-                        col_match = [c for c in inc_df.columns if 'answered by agent' in c.lower()]
-                        if col_match:
-                            debug_inc = inc_df[[col_match[0]]].drop_duplicates()
-                            debug_inc['Cleaned By App'] = debug_inc[col_match[0]].apply(clean_agent_name)
-                            st.dataframe(debug_inc)
-                            
-                    if out_df is not None:
-                        st.subheader("Outgoing File")
-                        col_match = [c for c in out_df.columns if 'agent name' in c.lower()]
-                        if col_match:
-                            debug_out = out_df[[col_match[0]]].drop_duplicates()
-                            debug_out['Cleaned By App'] = debug_out[col_match[0]].apply(clean_agent_name)
-                            st.dataframe(debug_out)
-
             else:
-                st.warning("No valid data found after processing. Check your column names or data content.")
-        except Exception as e:
-            st.error(f"Unexpected error: {e}")
-            st.write("Please check the console or try different files.")
+                st.warning("Please select at least one column to display.")
+            
+            # Debug View
+            with st.expander("Debug: Inspect Raw vs Cleaned Names"):
+                st.write("Check how agent names are extracted from each file.")
+                
+                if inc_df is not None:
+                    st.write("**Incoming File**")
+                    col = [c for c in inc_df.columns if 'answered by agent' in c.lower()]
+                    if col: st.dataframe(inc_df[[col[0]]].drop_duplicates().assign(Cleaned=lambda x: x[col[0]].apply(clean_agent_name)))
+
+                if out_df is not None:
+                    st.write("**Outgoing File**")
+                    col = [c for c in out_df.columns if 'agent name' in c.lower()]
+                    if col: st.dataframe(out_df[[col[0]]].drop_duplicates().assign(Cleaned=lambda x: x[col[0]].apply(clean_agent_name)))
+
+                if tick_df is not None:
+                    st.write("**Tickets File**")
+                    col = [c for c in tick_df.columns if c.lower() == 'agent']
+                    if col: st.dataframe(tick_df[[col[0]]].drop_duplicates().assign(Cleaned=lambda x: x[col[0]].apply(clean_agent_name)))
+
+        else:
+            st.warning("No valid data found after processing. Check your column names or data content.")
+            
+    except Exception as e:
+        st.error(f"Unexpected error: {e}")
+        st.write("Please check the console for details.")
