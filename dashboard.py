@@ -9,22 +9,38 @@ st.set_page_config(page_title="Tickets Tracking Dashboard", layout="wide")
 st.title("📞 Tickets Tracking Dashboard")
 st.markdown("Upload your **Incoming**, **Outgoing**, and **Tickets** CSV files to generate the agent performance report.")
 
-# Sidebar for file uploads
+# Sidebar for file uploads and settings
 with st.sidebar:
     st.header("Upload Files")
     incoming_file = st.file_uploader("Upload Incoming Calls CSV", type=['csv'], key="inc")
     outgoing_file = st.file_uploader("Upload Outgoing Calls CSV", type=['csv'], key="out")
     tickets_file = st.file_uploader("Upload Tickets Dump CSV", type=['csv'], key="tick")
+    
+    st.divider()
+    st.header("Settings")
+    report_date = st.date_input("Report Date", value="today")
 
 def clean_agent_name(name):
     if pd.isna(name):
-        return None
+        return 'Unassigned'
     name_str = str(name)
     # Remove "-Extension..." or " Extension..." or "(...)"
     cleaned = re.sub(r'\s*(?:-?Extension.*|\(.*\))', '', name_str, flags=re.IGNORECASE)
+    
+    # Specific Fixes
+    # Remove "Toga" if present (case insensitive)
+    cleaned = re.sub(r'\s*toga\s*', '', cleaned, flags=re.IGNORECASE)
+    
+    # Aggressively strip non-alphanumeric characters from ends (e.g. backticks)
+    cleaned = re.sub(r'^[^a-zA-Z0-9]+|[^a-zA-Z0-9]+$', '', cleaned)
+    
     cleaned = cleaned.strip()
-    # Normalize case
-    return cleaned.title() if cleaned else None
+    
+    # Filter "No Agent" or strictly invalid names -> Assign to "Unassigned"
+    if cleaned.lower() in ['no agent', 'n.a.', 'n/a', '---', '', 'nan', 'none']:
+        return 'Unassigned'
+        
+    return cleaned.title() if cleaned else 'Unassigned'
 
 @st.cache_data
 def load_csv(uploaded_file):
@@ -57,10 +73,34 @@ def load_csv(uploaded_file):
 @st.cache_data
 def process_data(incoming_df, outgoing_df, tickets_df):
     
+    collected_dates = set()
+    
     # --- Helper: Calculate Metrics for a single Source ---
     def calculate_source_metrics(df, source_type):
         metrics = pd.DataFrame()
         
+        # 0. Extract Date if possible
+        # Incoming/Outgoing: 'Date' (e.g., "12-Jan 22:33:18")
+        # Tickets: 'Created Time' (e.g., "15-12-2025 13:13")
+        date_col = None
+        if source_type in ['Incoming', 'Outgoing']:
+            col_match = [c for c in df.columns if c.lower() == 'date']
+            if col_match: date_col = col_match[0]
+        elif source_type == 'Tickets':
+            col_match = [c for c in df.columns if 'created time' in c.lower()]
+            if col_match: date_col = col_match[0]
+            
+        if date_col:
+            # Try parsing first few non-null
+            sample_dates = df[date_col].dropna().head(50)
+            for d in sample_dates:
+                try:
+                    # Heuristic: split by space to get date part
+                    d_part = str(d).split(' ')[0]
+                    collected_dates.add(d_part)
+                except:
+                    pass
+
         # 1. Identify Agent Column
         agent_col = None
         if source_type == 'Incoming':
@@ -80,8 +120,7 @@ def process_data(incoming_df, outgoing_df, tickets_df):
 
         # 2. Clean Names
         df['CleanAgentName'] = df[agent_col].apply(clean_agent_name)
-        # Filter invalid
-        df = df[~df['CleanAgentName'].isin(['---', '', 'Nan', 'None', None])]
+        # No need to drop - 'Unassigned' is returned for empty/invalid names
         
         if df.empty:
             return None
@@ -142,16 +181,12 @@ def process_data(incoming_df, outgoing_df, tickets_df):
         if m is not None: final_df = final_df.join(m, how='outer')
         
     if final_df.empty:
-        return pd.DataFrame()
+        return pd.DataFrame(), None
 
     # Fill NA
     final_df = final_df.fillna(0)
     
     # --- Aggregate Totals ---
-    
-    # Total Calls = Incoming Answered? No, usually Calls = Total Attempts, match previous logic?
-    # User asked for "Incoming Answered, Outgoing Answered, Total [Answered]". 
-    # Let's keep Total Calls (Attempts) and Total Answered.
     
     inc_calls = final_df['Incoming Calls'] if 'Incoming Calls' in final_df.columns else 0
     out_calls = final_df['Outgoing Calls'] if 'Outgoing Calls' in final_df.columns else 0
@@ -161,12 +196,30 @@ def process_data(incoming_df, outgoing_df, tickets_df):
     out_ans = final_df['Outgoing Answered'] if 'Outgoing Answered' in final_df.columns else 0
     final_df['Total Answered'] = inc_ans + out_ans
     
-    # Tickets Total? Maybe not needed unless asked.
+    # Ticket Totals
+    tick_res = final_df['Tickets Resolved'] if 'Tickets Resolved' in final_df.columns else 0
+    tick_clo = final_df['Tickets Closed'] if 'Tickets Closed' in final_df.columns else 0
+    final_df['Total Tickets Activity'] = tick_res + tick_clo
     
     final_df = final_df.fillna(0).astype(int)
     final_df.index.name = 'Agent Name'
+
+    # --- Add Cumulative Row ---
+    # Sum numeric columns
+    totals = final_df.sum()
+    totals.name = 'Total'
+    final_df = final_df._append(totals)
     
-    return final_df
+    # Sort dates to find range
+    date_str = None
+    if collected_dates:
+        sorted_dates = sorted(list(collected_dates))
+        if len(sorted_dates) == 1:
+            date_str = sorted_dates[0]
+        else:
+            date_str = f"{sorted_dates[0]} to {sorted_dates[-1]}"
+    
+    return final_df, date_str
 
 # Main Logic
 if incoming_file is None and outgoing_file is None and tickets_file is None:
@@ -178,20 +231,30 @@ else:
     tick_df = load_csv(tickets_file)
     
     try:
-        results = process_data(inc_df, out_df, tick_df)
+        results, doc_date = process_data(inc_df, out_df, tick_df)
+        
+        # Display Date (user-selected)
+        st.caption(f"📅 **Data Date: {report_date.strftime('%d-%b-%Y')}**")
         
         if results is not None and not results.empty:
-            # Summary Metrics - Adjusted based on what's available
+            # Summary Metrics - Use the 'Total' row directly to avoid double-counting
             st.divider()
             cols = st.columns(4)
-            cols[0].metric("Total Agents", len(results))
             
-            if 'Total Answered' in results.columns:
-                cols[1].metric("Total Calls Answered", results['Total Answered'].sum())
-            if 'Tickets Resolved' in results.columns:
-                cols[2].metric("Tickets Resolved", results['Tickets Resolved'].sum())
-            if 'Tickets Closed' in results.columns:
-                cols[3].metric("Tickets Closed", results['Tickets Closed'].sum())
+            # Exclude the 'Total' row for agent count
+            agent_count = len(results) - 1  # Subtract 1 for the Total row
+            cols[0].metric("Total Agents", agent_count)
+            
+            # Get values from the 'Total' row (last row)
+            total_row = results.loc['Total'] if 'Total' in results.index else None
+            
+            if total_row is not None:
+                if 'Total Answered' in results.columns:
+                    cols[1].metric("Total Calls Answered", int(total_row['Total Answered']))
+                if 'Total Tickets Activity' in results.columns:
+                    cols[2].metric("Total Tickets Activity", int(total_row['Total Tickets Activity']))
+                if 'Total Calls' in results.columns:
+                    cols[3].metric("Total Calls", int(total_row['Total Calls']))
             
             st.divider()
             st.subheader("Agent Performance Details")
@@ -199,10 +262,8 @@ else:
             # Column Selection
             all_cols = results.columns.tolist()
             
-            # Defaults based on latest user request + new ticket info
-            # "Incoming Answered, Outgoing Answered, Total [Answered]"
-            # Plus Tickets info is likely useful now that they uploaded it.
-            default_cols = ['Incoming Answered', 'Outgoing Answered', 'Total Answered', 'Tickets Resolved', 'Tickets Closed']
+            # Defaults
+            default_cols = ['Incoming Answered', 'Outgoing Answered', 'Total Answered', 'Tickets Resolved', 'Tickets Closed', 'Total Tickets Activity']
             
             # Valid defaults check
             valid_defaults = [c for c in default_cols if c in all_cols]
